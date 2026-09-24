@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+@theme {
+  --color-pitt-blue: #003594;
+  --color-pitt-blue-dark: #002a78;
+  --color-pitt-blue-deep: #001d5c;
+  --color-pitt-gold: #FFB81C;
+  --color-pitt-gold-light: #FFCC4D;
+  --color-surface: #f0f4f8;
+  --color-surface-blue: #DBEEFF;
+  --color-border-line: #b8d4ec;
+  --color-ink: #1a1a1a;
+  --color-muted: #5a6472;
+  --color-faint: #8896a6;
+  --color-ok: #15803d;
+  --color-ok-bg: #dcfce7;
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* ── Base ── */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: #ffffff;
+  color: var(--color-ink);
+  line-height: 1.6;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Section spacing (from reference) ── */
+.section { padding: 4rem 1.5rem; }
+@media (min-width: 768px) { .section { padding: 5rem 3rem; } }
+@media (min-width: 1024px) { .section { padding: 6rem 4rem; } }
+
+/* ── Container (avoid TW4 .container collision) ── */
+.wrap { max-width: 1280px; margin: 0 auto; }
+
+/* ── Card ── */
+.glow-card {
+  background: #ffffff;
+  border: 1px solid var(--color-border-line);
+  border-radius: 16px;
+  transition: all 0.3s ease;
+}
+.glow-card:hover {
+  border-color: var(--color-pitt-blue);
+  box-shadow: 0 0 40px 0 rgba(0, 53, 148, 0.1);
+  transform: translateY(-4px);
+}
+
+/* ── Button ── */
+.btn-primary {
+  background: var(--color-pitt-gold);
+  color: var(--color-pitt-blue);
+  font-weight: 700;
+  padding: 0.875rem 2rem;
+  border-radius: 12px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 0 20px 0 rgba(255, 184, 28, 0.3);
+  font-size: 1rem;
+}
+.btn-primary:hover { transform: scale(1.02); box-shadow: 0 0 30px 0 rgba(255, 184, 28, 0.5); }
+
+/* ── Grid background ── */
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(255,255,255,.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.04) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* ── Terminal ── */
+.terminal-window { background: var(--color-pitt-blue-deep); border-radius: 12px; overflow: hidden; border: 1px solid rgba(255,255,255,0.1); }
+.terminal-header { display: flex; align-items: center; gap: 8px; padding: 12px 16px; background: rgba(0,42,120,0.8); border-bottom: 1px solid rgba(255,255,255,0.1); }
+.terminal-dot { width: 12px; height: 12px; border-radius: 50%; }
+.terminal-dot-red { background: rgba(239,68,68,0.8); }
+.terminal-dot-yellow { background: rgba(234,179,8,0.8); }
+.terminal-dot-green { background: rgba(34,197,94,0.8); }
+
+/* ── Text gradient ── */
+.text-gradient {
+  background: linear-gradient(135deg, var(--color-pitt-blue), var(--color-pitt-gold));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Animations ── */
+@keyframes particle-float {
+  0%, 100% { transform: translateY(0) scale(1); opacity: 0.4; }
+  50% { transform: translateY(-20px) scale(1.1); opacity: 0.7; }
+}
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 6px 2px rgba(0,53,148,0.3); }
+  50% { box-shadow: 0 0 12px 4px rgba(0,53,148,0.6); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  html { scroll-behavior: auto; }
+}
