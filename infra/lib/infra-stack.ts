@@ -153,7 +153,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
             handler: 'extraction.handler',
             code: lambda.Code.fromAsset(backendPath, {bundling: extractionBundling}),
             functionName: 'canvas-olc-insights-extraction',
-            timeout: cdk.Duration.minutes(5),
+            timeout: cdk.Duration.minutes(15),
             memorySize: 2048,
             environment: {
                 REVIEWS_TABLE: reviewsTable.tableName,
@@ -206,6 +206,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
         const extractionTask = new sfn_tasks.LambdaInvoke(this, 'ExtractCourse', {
             lambdaFunction: extractionFunction,
             resultPath: '$.extractionResult',
+            taskTimeout: sfn.Timeout.duration(cdk.Duration.seconds(15 * 60 + 30)),
         });
 
         const evaluationTask = new sfn_tasks.LambdaInvoke(this, 'EvaluateObjectives', {
@@ -214,14 +215,32 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
                 review_id: sfn.JsonPath.stringAt('$.review_id'),
             }),
             resultPath: '$.evaluationResult',
+            taskTimeout: sfn.Timeout.duration(cdk.Duration.seconds(10 * 60 + 30)),
         });
+
+        // A Lambda that times out or crashes can't write its own error status,
+        // so the state machine does it — otherwise the review stays in progress forever.
+        const markFailed = new sfn_tasks.DynamoUpdateItem(this, 'MarkFailed', {
+            table: reviewsTable,
+            key: {review_id: sfn_tasks.DynamoAttributeValue.fromString(sfn.JsonPath.stringAt('$.review_id'))},
+            updateExpression: 'SET #st = :st, #err = :err',
+            expressionAttributeNames: {'#st': 'status', '#err': 'error'},
+            expressionAttributeValues: {
+                ':st': sfn_tasks.DynamoAttributeValue.fromString('error'),
+                ':err': sfn_tasks.DynamoAttributeValue.fromString(sfn.JsonPath.stringAt('$.error.Error')),
+            },
+            resultPath: sfn.JsonPath.DISCARD,
+        }).next(new sfn.Fail(this, 'ReviewFailed'));
+
+        extractionTask.addCatch(markFailed, {resultPath: '$.error'});
+        evaluationTask.addCatch(markFailed, {resultPath: '$.error'});
 
         const definition = extractionTask.next(evaluationTask);
 
         const stateMachine = new sfn.StateMachine(this, 'ReviewStateMachine', {
             stateMachineName: 'canvas-olc-insights-review-pipeline',
             definitionBody: sfn.DefinitionBody.fromChainable(definition),
-            timeout: cdk.Duration.hours(1),
+            timeout: cdk.Duration.minutes(30),
         });
 
         // Plan Lambda (async improvement plan generation)
@@ -233,6 +252,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
             functionName: 'canvas-olc-insights-plan',
             timeout: cdk.Duration.minutes(5),
             memorySize: 512,
+            retryAttempts: 0,
             environment: {
                 CONTENT_BUCKET: contentBucket.bucketName,
                 HISTORY_TABLE: historyTable.tableName,

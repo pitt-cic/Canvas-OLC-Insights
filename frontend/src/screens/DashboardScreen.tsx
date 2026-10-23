@@ -8,6 +8,9 @@ import { useFinalizeReview } from '../hooks/useFinalizeReview'
 import ProgressRing from '../components/ProgressRing'
 import { SCORE_LABELS, SCORE_COLORS, SECTIONS } from '../lib/constants'
 
+// Off unless VITE_ENABLE_BULK_ACCEPT=true at build time: bulk accept records unscored (human-judgment) items as 0.
+const BULK_ACCEPT_ENABLED = import.meta.env.VITE_ENABLE_BULK_ACCEPT === 'true'
+
 export default function DashboardScreen() {
   const navigate = useNavigate()
   const dashboardData = useAppStore((s) => s.dashboardData)
@@ -227,7 +230,7 @@ export default function DashboardScreen() {
         ) : (
           <>
             {/* Bulk accept */}
-            {unconfirmed.length > 0 && (
+            {BULK_ACCEPT_ENABLED && unconfirmed.length > 0 && (
               <div className="flex items-center justify-center mb-4">
                 <button
                   onClick={handleBulkAccept}

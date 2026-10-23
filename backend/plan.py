@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 import boto3
+from botocore.config import Config
 from boto3.dynamodb.conditions import Key
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
@@ -60,7 +61,12 @@ def _get_bedrock_model():
     from pydantic_ai.models.bedrock import BedrockConverseModel
     from pydantic_ai.providers.bedrock import BedrockProvider
 
-    provider = BedrockProvider(region_name=AWS_REGION, aws_read_timeout=300)
+    # botocore retries off: the app's own 429 loop is the only retry layer. The whole
+    # plan is one long call (routinely ~2 min), so the read timeout sits just under
+    # the 5-min Lambda limit, letting the handler still record its own error.
+    client = boto3.client("bedrock-runtime", region_name=AWS_REGION, config=Config(
+        read_timeout=240, connect_timeout=10, retries={"max_attempts": 1}))
+    provider = BedrockProvider(bedrock_client=client)
     return BedrockConverseModel(model_name=BEDROCK_MODEL_ID, provider=provider)
 
 

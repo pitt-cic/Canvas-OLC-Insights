@@ -21,7 +21,11 @@ SIDE EFFECTS:
         obj_id, title, proposed_score (0/1/2 or None), score_label, confidence,
         human_judgment_required, pattern ("AI" or "HUMAN"), accomplished_criteria,
         exemplary_criteria, key_findings, reasoning, improvement_suggestions
-    - Writes each verdict to S3 at reviews/{review_id}/verdicts/{obj_id}.json
+    - Writes each verdict to S3 at reviews/{review_id}/verdicts/{obj_id}.json as soon as
+      it is scored, so a run killed mid-way keeps its finished verdicts
+    - Stops scoring 60 s before the Lambda deadline; unfinished objectives get an error
+      verdict ("time budget exceeded"), and if more than MAX_ERROR_FRACTION of verdicts
+      are errors the run is marked "error"
     - Generates a 2-3 sentence course quality summary via Bedrock
     - Generates a 3-4 sentence course overview (subject area, learning outcomes, structure) via Bedrock
     - Updates DynamoDB review record status to "ready" with course_summary and course_overview
@@ -32,7 +36,8 @@ SCORING LOGIC:
       individual criterion verdicts (all accomplished MET → 1, all exemplary also MET → 2, else 0)
     - If model sets can_determine=False (objective not judgeable from static content),
       score is None and pattern is "HUMAN" (flagged for human reviewer)
-    - Progress counter is atomically incremented in DynamoDB after each objective completes
+    - Progress counter is atomically incremented in DynamoDB after each objective completes,
+      also refreshing updated_at (the heartbeat the API uses for stall detection)
 """
 
 import asyncio
@@ -43,10 +48,12 @@ import os
 import random
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 import boto3
+from botocore.config import Config
 from pydantic import BaseModel, Field
 from pydantic_ai.exceptions import ModelHTTPError
 
@@ -71,9 +78,9 @@ _table = _dynamodb.Table(REVIEWS_TABLE)
 
 def update_review_status(review_id: str, status: str, extra: dict = None):
     """Update a review's status field and optionally set additional attributes (e.g., course_name, error)."""
-    expr = "SET #st = :st"
-    names = {"#st": "status"}
-    values = {":st": status}
+    expr = "SET #st = :st, #upd = :upd"
+    names = {"#st": "status", "#upd": "updated_at"}
+    values = {":st": status, ":upd": datetime.now(timezone.utc).isoformat()}
     if extra:
         for i, (k, v) in enumerate(extra.items()):
             alias = f"#a{i}"
@@ -92,8 +99,8 @@ def increment_progress(review_id: str):
     """Atomically increment the review's progress counter by 1. Called after each objective is scored."""
     _table.update_item(
         Key={"review_id": review_id},
-        UpdateExpression="ADD progress :one",
-        ExpressionAttributeValues={":one": 1},
+        UpdateExpression="ADD progress :one SET updated_at = :u",
+        ExpressionAttributeValues={":one": 1, ":u": datetime.now(timezone.utc).isoformat()},
     )
 
 
@@ -154,6 +161,7 @@ class AIVerdict(BaseModel):
     improvement_suggestions: str
 
 MAX_CONCURRENT_CALLS = 8
+MAX_ERROR_FRACTION = float(os.environ.get("MAX_ERROR_FRACTION", "0.5"))
 
 SCORING_PHILOSOPHY = """You are scoring a Canvas course against a single quality objective at a time.
 
@@ -175,7 +183,11 @@ def _get_bedrock_model():
     from pydantic_ai.models.bedrock import BedrockConverseModel
     from pydantic_ai.providers.bedrock import BedrockProvider
 
-    provider = BedrockProvider(region_name=AWS_REGION, aws_read_timeout=300)
+    # botocore retries off: the app's own 429 loop is the only retry layer, and a
+    # stuck call fails in 2 min instead of holding a slot for 5.
+    client = boto3.client("bedrock-runtime", region_name=AWS_REGION, config=Config(
+        read_timeout=120, connect_timeout=10, retries={"max_attempts": 1}))
+    provider = BedrockProvider(bedrock_client=client)
     return BedrockConverseModel(model_name=BEDROCK_MODEL_ID, provider=provider)
 
 
@@ -327,29 +339,35 @@ async def _run_agent_with_retry(agent, prompt: str, obj_id: str):
             await asyncio.sleep(wait)
 
 
-async def score_one(agent, semaphore, obj_id, obj, counter, total, start_time, review_id=None):
+async def score_one(agent, semaphore, obj_id, obj, counter, total, start_time, review_id=None,
+                    syllabus_is_file_only=False):
     """Score a single objective, bounded by the semaphore so at most
-    MAX_CONCURRENT_CALLS run at once. Never raises — any failure becomes an
-    error_verdict instead, so one bad objective can't abort the whole run."""
+    MAX_CONCURRENT_CALLS run at once. A scoring failure becomes an
+    error_verdict instead, so one bad objective can't abort the whole run.
+    The verdict is persisted here, not after all 50 finish, so a run killed
+    mid-way keeps its finished work."""
     async with semaphore:
         try:
             ai_result = (await _run_agent_with_retry(agent, objective_prompt(obj_id, obj), obj_id)).output
             verdict = build_verdict(obj_id, obj, ai_result)
         except Exception as e:
             verdict = error_verdict(obj_id, obj, e)
+        verdict["syllabus_is_file_only"] = syllabus_is_file_only
         counter["done"] += 1
         if review_id:
+            await asyncio.to_thread(put_verdict, review_id, obj_id, verdict)
             try:
-                increment_progress(review_id)
+                await asyncio.to_thread(increment_progress, review_id)
             except Exception as e:
                 logger.warning("progress counter update failed for review %s, obj %s: %s", review_id, obj_id, e)
         return obj_id, verdict
 
 
-async def score_course_async(course_context_dict, review_id=None):
-    """Score all 50 objectives concurrently and return {obj_id: verdict}.
-    Task order matches OBJECTIVES' insertion order regardless of which
-    finishes first — asyncio.gather preserves input order in its results."""
+async def score_course_async(course_context_dict, deadline: float, review_id=None):
+    """Score all 50 objectives concurrently and return {obj_id: verdict} in
+    OBJECTIVES order. Objectives still running at `deadline` (a time.monotonic()
+    value) are cancelled and get a persisted error verdict, so the Lambda ends
+    cleanly instead of being killed with the review left in progress."""
     course_context = load_course_context(course_context_dict)
     agent = build_agent(course_context)
 
@@ -362,17 +380,34 @@ async def score_course_async(course_context_dict, review_id=None):
     total = len(OBJECTIVES)
     counter = {"done": 0}
     start_time = time.monotonic()
-    tasks = [
-        score_one(agent, semaphore, obj_id, obj, counter, total, start_time, review_id)
+    tasks = {
+        asyncio.create_task(score_one(agent, semaphore, obj_id, obj, counter, total, start_time,
+                                      review_id, syllabus_is_file_only)): obj_id
         for obj_id, obj in OBJECTIVES.items()
-    ]
-    pairs = await asyncio.gather(*tasks)
+    }
+    done, pending = await asyncio.wait(tasks, timeout=max(0.0, deadline - time.monotonic()))
+    for task in pending:
+        task.cancel()
 
     results = {}
-    for obj_id, verdict in pairs:
+    for task, obj_id in tasks.items():
+        if task in done:
+            results[obj_id] = task.result()[1]
+            continue
+        verdict = error_verdict(obj_id, OBJECTIVES[obj_id], TimeoutError("time budget exceeded"))
         verdict["syllabus_is_file_only"] = syllabus_is_file_only
+        if review_id:
+            await asyncio.to_thread(put_verdict, review_id, obj_id, verdict)
         results[obj_id] = verdict
     return results
+
+
+def _check_error_fraction(verdicts: dict):
+    """Fail the run when most objectives errored — a review that is mostly
+    error verdicts isn't a usable result and shouldn't be shown as "ready"."""
+    errors = sum(1 for v in verdicts.values() if v.get("error"))
+    if errors > MAX_ERROR_FRACTION * len(verdicts):
+        raise RuntimeError(f"{errors}/{len(verdicts)} objectives failed to score")
 
 
 def _aggregate_verdicts_by_section(verdicts: dict) -> dict:
@@ -481,16 +516,14 @@ Return plain text only."""
 
 # --- Handler ---
 
-async def _evaluate_and_summarize(review_id, content):
+async def _evaluate_and_summarize(review_id, content, deadline):
     """Run scoring then the two summary generations, in that order — the
     summaries describe the scored results, so they need the verdicts first."""
     course_context = content["course_context"]
     course_name = content.get("course_name", "")
 
-    verdicts = await score_course_async(course_context, review_id)
-
-    for obj_id, verdict in verdicts.items():
-        put_verdict(review_id, obj_id, verdict)
+    verdicts = await score_course_async(course_context, deadline, review_id)
+    _check_error_fraction(verdicts)
 
     course_summary = await generate_summary(course_name, verdicts)
     course_overview = await generate_overview(course_name, content)
@@ -503,12 +536,14 @@ def handler(event, context):
     bounded-concurrency Bedrock calls, writes verdicts, generates summaries, and
     sets status to ready."""
     review_id = event["review_id"]
+    # 60 s headroom for the summaries and the final status write.
+    deadline = time.monotonic() + context.get_remaining_time_in_millis() / 1000 - 60
 
     try:
         content = get_content(review_id)
 
         verdicts, course_summary, course_overview = asyncio.run(
-            _evaluate_and_summarize(review_id, content)
+            _evaluate_and_summarize(review_id, content, deadline)
         )
 
         update_review_status(review_id, "ready", {

@@ -23,7 +23,7 @@ export default function Demo() {
             </div>
             <div className="relative aspect-video bg-black">
               <video className="w-full h-full" controls preload="metadata" playsInline>
-                <source src="./demo.mp4" type="video/mp4" />
+                <source src="./media/CourseQANewDemoCompressed.mp4" type="video/mp4" />
               </video>
             </div>
           </div>

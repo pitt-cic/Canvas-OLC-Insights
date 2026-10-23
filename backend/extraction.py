@@ -21,15 +21,19 @@ SIDE EFFECTS:
         pages            — fetched page content with body text, embedded media URLs, orientation flags
         discussions      — discussion topics with cleaned message text
         announcements    — announcements with cleaned text
-        quality_checks   — {links: {broken, unreachable, timeout, ok_count, ...}, spelling: {flagged_terms, ...}}
+        quality_checks   — {links: {broken, unreachable, timeout, auth_required, not_checked,
+                           ok_count, ...}, spelling: {flagged_terms, ...}}; Canvas-internal links are
+                           verified against the course's own resource lists, not over HTTP
         content_gaps     — inaccessible file attachments and external LTI tool references
         extracted_files  — list of files found during the crawl with extraction status
+                           (files over MAX_FILE_BYTES are not read and show FAILED)
         syllabus         — plain text of syllabus (from HTML or file fallback)
         syllabus_html    — raw syllabus HTML
         syllabus_is_file_only — whether syllabus was a linked file rather than inline HTML
         course_name      — human-readable course name from Canvas
         course_id        — Canvas course ID
     - Updates DynamoDB review record status to "extracting" with course_name
+      (every status write also sets updated_at, the heartbeat the API uses for stall detection)
     - On failure: updates status to "error" with error detail, then re-raises
 
 DESIGN NOTE — every Canvas resource is fetched exactly once:
@@ -53,6 +57,7 @@ import ipaddress
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from io import BytesIO
 from urllib.parse import urlparse, urljoin
 
@@ -191,10 +196,11 @@ def canvas_get(url: str, **kwargs) -> requests.Response:
     if not url.startswith("http"):
         url = f"{CANVAS_BASE_URL}/api/v1{url}"
     _check_canvas_scope(url)
-    resp = requests.get(url, headers=canvas_headers(), **kwargs)
+    timeout = kwargs.pop("timeout", (5, 20))
+    resp = requests.get(url, headers=canvas_headers(), timeout=timeout, **kwargs)
     if resp.status_code == 401:
         invalidate_canvas_token()
-        resp = requests.get(url, headers=canvas_headers(), **kwargs)
+        resp = requests.get(url, headers=canvas_headers(), timeout=timeout, **kwargs)
     return resp
 
 
@@ -255,9 +261,9 @@ _table = _dynamodb.Table(REVIEWS_TABLE)
 
 def update_review_status(review_id: str, status: str, extra: dict = None):
     """Update a review's status field and optionally set additional attributes (e.g., course_name, error)."""
-    expr = "SET #st = :st"
-    names = {"#st": "status"}
-    values = {":st": status}
+    expr = "SET #st = :st, #upd = :upd"
+    names = {"#st": "status", "#upd": "updated_at"}
+    values = {":st": status, ":upd": datetime.now(timezone.utc).isoformat()}
     if extra:
         for i, (k, v) in enumerate(extra.items()):
             alias = f"#a{i}"
@@ -476,10 +482,31 @@ def _parse_file_bytes(filename: str, raw: bytes) -> str:
     return extractor(raw) if extractor else ""
 
 
+# Meant to stop videos and archives from being read in full, not to limit documents.
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", 50 * 1024 * 1024))
+
+
+def _download_file(url: str) -> bytes | None:
+    """Stream a file with timeouts, giving up past MAX_FILE_BYTES so one huge
+    attachment can't eat the Lambda's time or memory. None means "too big"."""
+    resp = requests.get(url, headers=canvas_headers(), stream=True, timeout=(5, 30))
+    try:
+        chunks, size = [], 0
+        for chunk in resp.iter_content(64 * 1024):
+            size += len(chunk)
+            if size > MAX_FILE_BYTES:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        resp.close()
+
+
 def _fetch_file_text(file_meta: dict) -> str:
-    """Download and parse one file's content, given its /files metadata."""
-    raw = requests.get(file_meta["url"], headers=canvas_headers()).content
-    return _parse_file_bytes(file_meta["filename"], raw)
+    """Download and parse one file's content, given its /files metadata.
+    An over-cap file yields "" so it shows as FAILED in extracted_files."""
+    raw = _download_file(file_meta["url"])
+    return _parse_file_bytes(file_meta["filename"], raw) if raw is not None else ""
 
 
 # A single legitimately dense file we've observed in real courses tops out
@@ -867,13 +894,18 @@ def _build_structural_metadata(seeds, crawl) -> dict:
 # Kept as its own clearly separate section: unlike everything above, this
 # isn't about extracting course content — it's validating already-extracted
 # HTML (broken links, flagged spelling) for the dashboard and the E20
-# objective. Functionally unchanged from before.
+# objective. Link checking runs under a wall-clock budget so one stalled
+# host can't push extraction past its Lambda timeout.
 # ---------------------------------------------------------------------------
 
 _MAX_LINKS_PER_COURSE = 40
 _MAX_REDIRECTS = 5
-_REQUEST_TIMEOUT = 8
+_HOP_TIMEOUT = (3, 6)
 _MAX_WORKERS = 12
+LINK_CHECK_BUDGET_S = 60
+# A redirect to any of these means "needs institutional login", not "broken".
+IDP_HOSTS = {"passport.pitt.edu"}
+_CANVAS_HOST = urlparse(CANVAS_BASE_URL).hostname
 
 _URL_REGEX = re.compile(r'href=["\']([^"\']+)["\']|(?<!["\'])(https?://[^\s<>"\')]+)', re.IGNORECASE)
 
@@ -891,14 +923,15 @@ def _extract_urls(html_or_text: str, base_url: str = "") -> list:
     urls = set()
     for m in _URL_REGEX.finditer(html_or_text):
         url = m.group(1) or m.group(2)
-        if not url:
+        if not url or url.startswith("#"):
             continue
         if base_url and not url.lower().startswith(("http://", "https://")):
             try:
                 url = urljoin(base_url, url)
             except ValueError:
                 continue
-        urls.add(url.strip())
+        if url.lower().startswith(("http://", "https://")):
+            urls.add(url.strip())
     return sorted(urls)
 
 
@@ -945,7 +978,8 @@ def _is_safe_url(url: str) -> tuple:
 
 
 def _check_one_link(url: str) -> dict:
-    """Check a single URL by following redirects manually (re-checking SSRF safety at each hop)."""
+    """Check a single URL by following redirects manually (re-checking SSRF safety at each hop).
+    Streams and closes each response so only headers are read, never a large body."""
     current_url = url
     for hop in range(_MAX_REDIRECTS + 1):
         safe, reason = _is_safe_url(current_url)
@@ -953,19 +987,23 @@ def _check_one_link(url: str) -> dict:
             return {"url": url, "status": "BLOCKED_UNSAFE", "detail": reason}
         try:
             resp = requests.get(
-                current_url, timeout=_REQUEST_TIMEOUT, allow_redirects=False,
+                current_url, timeout=_HOP_TIMEOUT, allow_redirects=False, stream=True,
                 headers={"User-Agent": "Canvas-QA-Bot-LinkCheck/1.0"},
             )
         except requests.Timeout:
-            return {"url": url, "status": "TIMEOUT", "detail": f"timed out after {_REQUEST_TIMEOUT}s"}
+            return {"url": url, "status": "TIMEOUT", "detail": f"timed out after {_HOP_TIMEOUT[1]}s"}
         except requests.RequestException as e:
             return {"url": url, "status": "UNREACHABLE", "detail": str(e)[:150]}
+        resp.close()
 
         if resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("Location")
             if not location:
                 return {"url": url, "status": "BROKEN", "detail": "redirect with no Location header"}
             current_url = urljoin(current_url, location)
+            target = urlparse(current_url)
+            if target.path.startswith("/login") or target.hostname in IDP_HOSTS:
+                return {"url": url, "status": "AUTH_REQUIRED", "detail": "redirects to a login page"}
             continue
 
         if 200 <= resp.status_code < 400:
@@ -978,20 +1016,67 @@ def _check_one_link(url: str) -> dict:
     return {"url": url, "status": "BROKEN", "detail": f"exceeded {_MAX_REDIRECTS} redirects"}
 
 
-def _check_links(urls: list, max_links: int = _MAX_LINKS_PER_COURSE) -> dict:
-    """Check up to max_links URLs in parallel (12 workers) and return aggregated results grouped by status category."""
-    selected = urls[:max_links]
-    truncated = len(urls) > max_links
-    results = []
+def _known_course_targets(seeds: dict) -> set:
+    """Every (kind, id) the course actually has, in LINK_RE's terms, so internal
+    links can be verified against the seed lists. Over HTTP, Canvas bounces an
+    unauthenticated checker to login, which used to be reported as broken."""
+    # /courses/:id/assignments/syllabus is Canvas's built-in syllabus page, never in the assignments list.
+    known = {("assignments", "syllabus")}
+    known |= {("pages", p["url"]) for p in seeds["pages"]}
+    known |= {("pages", str(p["page_id"])) for p in seeds["pages"] if p.get("page_id")}
+    for kind, seed_key in (("assignments", "assignments"), ("quizzes", "quizzes"), ("files", "files"),
+                           ("discussion_topics", "discussions"), ("discussion_topics", "announcements")):
+        known |= {(kind, str(item["id"])) for item in seeds[seed_key]}
+    return known
 
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        futures = {executor.submit(_check_one_link, u): u for u in selected}
-        for future in as_completed(futures):
+
+def _classify_internal(url: str, course_id, known: set) -> dict | None:
+    """Classify a Canvas-hosted link without fetching it. Returns None for
+    non-Canvas URLs, which go to the HTTP checker instead."""
+    parsed = urlparse(url)
+    if parsed.hostname != _CANVAS_HOST:
+        return None
+    m = LINK_RE.search(parsed.path)
+    if not m or m.group(1) != str(course_id):
+        return {"url": url, "status": "NOT_CHECKED", "detail": "Canvas link outside this course's resources"}
+    if (m.group(2), m.group(3)) in known:
+        return {"url": url, "status": "OK", "detail": "course resource exists"}
+    return {"url": url, "status": "BROKEN", "detail": "target not found in course"}
+
+
+def _check_external(urls: list) -> list:
+    """Check URLs in parallel within LINK_CHECK_BUDGET_S; anything unfinished at
+    the deadline is NOT_CHECKED. No `with` block — its exit would wait for stragglers."""
+    executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+    futures = {executor.submit(_check_one_link, u): u for u in urls}
+    results, seen = [], set()
+    try:
+        for future in as_completed(futures, timeout=LINK_CHECK_BUDGET_S):
+            seen.add(future)
             try:
                 results.append(future.result())
             except Exception as e:
-                url = futures[future]
-                results.append({"url": url, "status": "CHECK_FAILED", "detail": str(e)[:150]})
+                results.append({"url": futures[future], "status": "CHECK_FAILED", "detail": str(e)[:150]})
+    except TimeoutError:
+        results += [{"url": u, "status": "NOT_CHECKED", "detail": f"link-check budget of {LINK_CHECK_BUDGET_S}s used up"}
+                    for f, u in futures.items() if f not in seen]
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
+def _check_links(urls: list, course_id, known: set, max_links: int = _MAX_LINKS_PER_COURSE) -> dict:
+    """Classify Canvas-internal links against the course's resources, HTTP-check
+    up to max_links external URLs, and return results grouped by status category."""
+    results, external = [], []
+    for u in urls:
+        internal = _classify_internal(u, course_id, known)
+        if internal:
+            results.append(internal)
+        else:
+            external.append(u)
+    selected = external[:max_links]
+    results += _check_external(selected)
 
     by_status = {}
     for r in results:
@@ -999,14 +1084,15 @@ def _check_links(urls: list, max_links: int = _MAX_LINKS_PER_COURSE) -> dict:
 
     return {
         "total_urls_found": len(urls),
-        "checked": len(selected),
-        "truncated": truncated,
+        "checked": len(results),
+        "truncated": len(external) > max_links,
         "results": results,
         "broken": by_status.get("BROKEN", []),
         "unreachable": by_status.get("UNREACHABLE", []),
         "timeout": by_status.get("TIMEOUT", []),
         "blocked_unsafe": by_status.get("BLOCKED_UNSAFE", []),
         "auth_required": by_status.get("AUTH_REQUIRED", []),
+        "not_checked": by_status.get("NOT_CHECKED", []),
         "ok_count": len(by_status.get("OK", [])),
     }
 
@@ -1039,7 +1125,7 @@ def _check_spelling(text: str, max_chars: int = 20000) -> dict:
     }
 
 
-def _run_quality_checks(syllabus_html: str, metadata: dict) -> dict:
+def _run_quality_checks(syllabus_html: str, metadata: dict, course_id, known: set) -> dict:
     """Run link checking and spell checking against all HTML content collected
     during structural metadata assembly."""
     html_parts = [syllabus_html]
@@ -1049,11 +1135,7 @@ def _run_quality_checks(syllabus_html: str, metadata: dict) -> dict:
     combined_html = "\n".join(p for p in html_parts if p)
 
     urls = _extract_urls(combined_html, base_url=f"{CANVAS_BASE_URL}/")
-    link_results = _check_links(urls) if urls else {
-        "total_urls_found": 0, "checked": 0, "truncated": False,
-        "results": [], "broken": [], "unreachable": [], "timeout": [],
-        "blocked_unsafe": [], "auth_required": [], "ok_count": 0,
-    }
+    link_results = _check_links(urls, course_id, known)
 
     combined_text = re.sub(r"<[^>]+>", " ", combined_html)
     combined_text = re.sub(r"\s+", " ", combined_text).strip()
@@ -1117,7 +1199,8 @@ def handler(event, context):
         course_context = {f"{kind}:{node_id}": data for (kind, node_id), data in crawl["store"].items()}
 
         metadata = _build_structural_metadata(seeds, crawl)
-        quality_checks = _run_quality_checks(crawl["syllabus_html"], metadata)
+        quality_checks = _run_quality_checks(crawl["syllabus_html"], metadata, course_id,
+                                             _known_course_targets(seeds))
         content = _assemble_content(course_id, crawl, metadata, quality_checks, course_context)
 
         put_content(review_id, content)

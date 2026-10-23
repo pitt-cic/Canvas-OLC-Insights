@@ -56,7 +56,7 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
@@ -185,10 +185,11 @@ def _canvas_headers():
 def _canvas_get(url: str, **kwargs) -> requests.Response:
     """Scope-checked GET with automatic token refresh on 401."""
     _check_canvas_scope(url)
-    resp = requests.get(url, headers=_canvas_headers(), **kwargs)
+    timeout = kwargs.pop("timeout", (5, 20))
+    resp = requests.get(url, headers=_canvas_headers(), timeout=timeout, **kwargs)
     if resp.status_code == 401:
         invalidate_canvas_token()
-        resp = requests.get(url, headers=_canvas_headers(), **kwargs)
+        resp = requests.get(url, headers=_canvas_headers(), timeout=timeout, **kwargs)
     return resp
 
 
@@ -243,9 +244,9 @@ def get_review(review_id: str) -> dict:
 
 def update_review_status(review_id: str, status: str, extra: dict = None):
     """Update a review's status field and optionally set additional attributes (e.g., course_name, error)."""
-    expr = "SET #st = :st"
-    names = {"#st": "status"}
-    values = {":st": status}
+    expr = "SET #st = :st, #upd = :upd"
+    names = {"#st": "status", "#upd": "updated_at"}
+    values = {":st": status, ":upd": datetime.now(timezone.utc).isoformat()}
     if extra:
         for i, (k, v) in enumerate(extra.items()):
             alias = f"#a{i}"
@@ -467,6 +468,7 @@ def _start_review(event, match):
         "progress": 0,
         "total": 50,
         "started_at": now,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
         "scores": {},
         "course_summary": "",
         "course_overview": "",
@@ -481,12 +483,33 @@ def _start_review(event, match):
     return {"review_id": review_id, "status": "started"}
 
 
+# Above the 15-min Extraction limit, so a live run is never reported as stalled.
+STALL_MINUTES = 20
+# Plan Lambda limit is 5 min.
+PLAN_STALE_MINUTES = 6
+
+
+def _minutes_since(when: datetime) -> float:
+    return (datetime.now(timezone.utc) - when).total_seconds() / 60
+
+
+def _is_stalled(r: dict) -> bool:
+    """An in-progress review with no heartbeat for STALL_MINUTES died without
+    recording an error (e.g. a crash the state machine never saw)."""
+    if r.get("status") not in ("ingesting", "extracting") or not r.get("updated_at"):
+        return False
+    return _minutes_since(datetime.fromisoformat(r["updated_at"])) > STALL_MINUTES
+
+
 def _get_status(event, match):
-    """GET /api/review/{review_id}/status — Return current review progress and status."""
+    """GET /api/review/{review_id}/status — Return current review progress and status.
+    A stalled run is reported as an error (read-only; the record isn't changed)."""
     review_id = match.group("review_id")
     r = get_review(review_id)
     if not r:
         raise HttpError(404, "Review not found")
+    if _is_stalled(r):
+        r = {**r, "status": "error", "error": f"Stalled — no progress for {STALL_MINUTES} min"}
     return {
         "review_id": review_id,
         "status": r.get("status"),
@@ -1101,12 +1124,16 @@ def _post_improvement_plan(event, match):
 
 
 def _get_improvement_plan(event, match):
-    """GET /api/courses/{course_id}/improvement-plan — Fetch the current improvement plan JSON from S3 (may be 'generating' or 'ready')."""
+    """GET /api/courses/{course_id}/improvement-plan — Fetch the current improvement plan JSON from S3 (may be 'generating' or 'ready').
+    A plan still 'generating' after PLAN_STALE_MINUTES means the plan Lambda died; report it as an error."""
     course_id = match.group("course_id")
     plan_key = f"plans/{course_id}/improvement.json"
     try:
         resp = _s3.get_object(Bucket=CONTENT_BUCKET, Key=plan_key)
-        return json.loads(resp["Body"].read())
+        plan = json.loads(resp["Body"].read())
+        if plan.get("status") == "generating" and _minutes_since(resp["LastModified"]) > PLAN_STALE_MINUTES:
+            return {"status": "error", "error": "Plan generation timed out"}
+        return plan
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchKey":
             raise HttpError(404, "No improvement plan found")
