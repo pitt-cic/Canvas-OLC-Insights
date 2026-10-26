@@ -18,9 +18,13 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
     constructor(scope: Construct, id: string, props?: cdk.StackProps) {
         super(scope, id, props);
 
+        // Optional suffix for a second copy in the same account. Unset must leave every name
+        // unchanged: renaming a deployed table or bucket makes CloudFormation replace it (data loss).
+        const stage = process.env.STAGE ? `-${process.env.STAGE}` : '';
+
         // DynamoDB Table — ephemeral review sessions
         const reviewsTable = new dynamodb.Table(this, 'ReviewsTable', {
-            tableName: 'canvas-olc-insights-reviews',
+            tableName: `canvas-olc-insights-reviews${stage}`,
             partitionKey: {name: 'review_id', type: dynamodb.AttributeType.STRING},
             billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
             removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -29,7 +33,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
         // DynamoDB Table — finalized scorecards, kept ephemeral like the rest
         // of this stack (DESTROY is intentional here, not an oversight)
         const historyTable = new dynamodb.Table(this, 'CourseHistoryTable', {
-            tableName: 'canvas-olc-insights-history',
+            tableName: `canvas-olc-insights-history${stage}`,
             partitionKey: {name: 'course_id', type: dynamodb.AttributeType.STRING},
             sortKey: {name: 'completed_at', type: dynamodb.AttributeType.STRING},
             billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -38,7 +42,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
 
         // S3 Content Bucket
         const contentBucket = new s3.Bucket(this, 'ContentBucket', {
-            bucketName: `canvas-olc-insights-content-${this.account}-${this.region}`,
+            bucketName: `canvas-olc-insights-content${stage}-${this.account}-${this.region}`,
             removalPolicy: cdk.RemovalPolicy.DESTROY,
             autoDeleteObjects: true,
             lifecycleRules: [
@@ -51,7 +55,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
 
         // S3 Frontend Bucket
         const frontendBucket = new s3.Bucket(this, 'FrontendBucket', {
-            bucketName: `canvas-olc-insights-frontend-${this.account}-${this.region}`,
+            bucketName: `canvas-olc-insights-frontend${stage}-${this.account}-${this.region}`,
             removalPolicy: cdk.RemovalPolicy.DESTROY,
             autoDeleteObjects: true,
             blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -59,7 +63,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
 
         // Cognito User Pool
         const userPool = new cognito.UserPool(this, 'UserPool', {
-            userPoolName: 'canvas-olc-insights-user-pool',
+            userPoolName: `canvas-olc-insights-user-pool${stage}`,
             selfSignUpEnabled: false,
             signInAliases: {email: true},
             autoVerify: {email: true},
@@ -77,7 +81,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
 
         const userPoolClient = new cognito.UserPoolClient(this, 'UserPoolClient', {
             userPool,
-            userPoolClientName: 'canvas-olc-insights-client',
+            userPoolClientName: `canvas-olc-insights-client${stage}`,
             authFlows: {
                 userSrp: true,
                 userPassword: true,
@@ -108,13 +112,13 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
         // appending the account ID keeps it unique to this deployment.
         const userPoolDomain = userPool.addDomain('UserPoolDomain', {
             cognitoDomain: {
-                domainPrefix: `canvas-olc-insights-${this.account}`,
+                domainPrefix: `canvas-olc-insights${stage}-${this.account}`,
             },
         });
 
         // Canvas API token — Lambdas fetch from SSM SecureString at runtime;
         // only the parameter name is in the template, never the plaintext
-        const canvasApiTokenParam = '/qa-bot/canvas-api-token';
+        const canvasApiTokenParam = `/qa-bot${stage}/canvas-api-token`;
         const canvasApiTokenArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${canvasApiTokenParam}`;
 
         // Lambda bundling options
@@ -152,7 +156,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
             architecture: lambda.Architecture.ARM_64,
             handler: 'extraction.handler',
             code: lambda.Code.fromAsset(backendPath, {bundling: extractionBundling}),
-            functionName: 'canvas-olc-insights-extraction',
+            functionName: `canvas-olc-insights-extraction${stage}`,
             timeout: cdk.Duration.minutes(15),
             memorySize: 2048,
             environment: {
@@ -176,7 +180,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
             architecture: lambda.Architecture.ARM_64,
             handler: 'evaluation.handler',
             code: lambda.Code.fromAsset(backendPath, {bundling: pythonBundling}),
-            functionName: 'canvas-olc-insights-evaluation',
+            functionName: `canvas-olc-insights-evaluation${stage}`,
             timeout: cdk.Duration.minutes(10),
             memorySize: 512,
             environment: {
@@ -238,7 +242,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
         const definition = extractionTask.next(evaluationTask);
 
         const stateMachine = new sfn.StateMachine(this, 'ReviewStateMachine', {
-            stateMachineName: 'canvas-olc-insights-review-pipeline',
+            stateMachineName: `canvas-olc-insights-review-pipeline${stage}`,
             definitionBody: sfn.DefinitionBody.fromChainable(definition),
             timeout: cdk.Duration.minutes(30),
         });
@@ -249,7 +253,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
             architecture: lambda.Architecture.ARM_64,
             handler: 'plan.handler',
             code: lambda.Code.fromAsset(backendPath, {bundling: pythonBundling}),
-            functionName: 'canvas-olc-insights-plan',
+            functionName: `canvas-olc-insights-plan${stage}`,
             timeout: cdk.Duration.minutes(5),
             memorySize: 512,
             retryAttempts: 0,
@@ -277,7 +281,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
             architecture: lambda.Architecture.ARM_64,
             handler: 'api.handler',
             code: lambda.Code.fromAsset(backendPath, {bundling: pythonBundling}),
-            functionName: 'canvas-olc-insights-api',
+            functionName: `canvas-olc-insights-api${stage}`,
             timeout: cdk.Duration.minutes(1),
             memorySize: 1024,
             environment: {
@@ -303,13 +307,13 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
 
         // API Gateway
         const api = new apigateway.RestApi(this, 'ApiGateway', {
-            restApiName: 'Canvas OLC Insights API',
+            restApiName: `Canvas OLC Insights API${stage}`,
             description: 'Canvas OLC Insights REST API',
         });
 
         const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
             cognitoUserPools: [userPool],
-            authorizerName: 'canvas-olc-insights-authorizer',
+            authorizerName: `canvas-olc-insights-authorizer${stage}`,
         });
 
         const proxyResource = api.root.addResource('api').addProxy({
@@ -323,10 +327,20 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
 
         // CloudFront Distribution
         const oac = new cloudfront.S3OriginAccessControl(this, 'FrontendOAC', {
-            originAccessControlName: 'canvas-olc-insights-frontend-oac',
+            originAccessControlName: `canvas-olc-insights-frontend-oac${stage}`,
         });
 
         const apiDomainName = `${api.restApiId}.execute-api.${this.region}.amazonaws.com`;
+
+        // SPA fallback on the S3 behavior only: a path whose last segment has no file extension is a
+        // client-side route, so serve the app. A distribution-wide errorResponses rule would also turn
+        // the API's 403/404s into index.html with HTTP 200.
+        const spaRewrite = new cloudfront.Function(this, 'SpaRewrite', {
+            runtime: cloudfront.FunctionRuntime.JS_2_0,
+            code: cloudfront.FunctionCode.fromInline(
+                "function handler(event) { var r = event.request; if (r.uri.split('/').pop().indexOf('.') === -1) { r.uri = '/index.html'; } return r; }",
+            ),
+        });
 
         const distribution = new cloudfront.Distribution(this, 'Distribution', {
             defaultBehavior: {
@@ -334,6 +348,7 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
                     originAccessControl: oac,
                 }),
                 viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                functionAssociations: [{function: spaRewrite, eventType: cloudfront.FunctionEventType.VIEWER_REQUEST}],
             },
             additionalBehaviors: {
                 '/api/*': {
@@ -347,20 +362,6 @@ export class CanvasOlcInsightsStack extends cdk.Stack {
                 },
             },
             defaultRootObject: 'index.html',
-            errorResponses: [
-                {
-                    httpStatus: 403,
-                    responseHttpStatus: 200,
-                    responsePagePath: '/index.html',
-                    ttl: cdk.Duration.seconds(0),
-                },
-                {
-                    httpStatus: 404,
-                    responseHttpStatus: 200,
-                    responsePagePath: '/index.html',
-                    ttl: cdk.Duration.seconds(0),
-                },
-            ],
         });
 
         // Deploy the built frontend into frontendBucket and invalidate

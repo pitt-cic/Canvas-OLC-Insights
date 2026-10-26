@@ -12,9 +12,11 @@
 | [Deployment](#deployment)               | How to install and deploy the solution              |
 | [Usage](#usage)                         | How to use the application                          |
 | [Costs](#costs)                         | Estimated AWS costs for running the solution        |
+| [Known Limitations](#known-limitations) | Audit items deliberately not yet addressed          |
 | [Troubleshooting](#troubleshooting)     | Common issues and solutions                         |
 | [Credits](#credits)                     | Meet the team behind this project                   |
 | [License](#license)                     | See the project's license information               |
+| [Scoring Criteria](#scoring-criteria)   | Where the scoring criteria come from                |
 | [Disclaimers](#disclaimers)             | Important legal disclaimers                         |
 
 ---
@@ -117,8 +119,8 @@ Each objective is scored on a 3-point scale: **0** (Developing), **1** (Accompli
 - **Authentication**: Cognito authorizer on all API Gateway routes — unauthenticated requests are rejected
 - **Canvas API authorization**: Authorization is enforced by the Canvas API token's own grant within Canvas LMS — the application can access any course/account the token has permission to see. A scope guard validates that API calls match expected Canvas endpoint patterns (16 regex patterns) to catch programming errors before they reach the network, but this is not an authorization mechanism
 - **SSRF protection**: Content quality link checker validates URLs against private IP ranges before making requests
-- **Resource constraints**: File downloads are limited by Lambda memory (2 GB) and timeout (5 minutes); the system attempts to download all files referenced in course content with no explicit size or count restrictions
-- **Data lifecycle**: 30-day S3 lifecycle policy on review content; no indefinite data retention
+- **Resource constraints**: Each file download is capped at 50 MB (larger files are skipped and listed as failed), every Canvas request has a timeout, link checking stops after 60 seconds, and the Extraction Lambda has a 15-minute limit
+- **Data lifecycle**: Extracted course content and AI verdicts (`reviews/` in the content bucket) expire after 30 days. Finalized scorecard PDFs (`finalized/`), improvement plans (`plans/`), the review and history tables, and CloudWatch logs are kept until deleted — no expiry or log retention period is configured
 - **S3 access control**: Frontend and content buckets block all public access; CloudFront uses Origin Access Control
 - **Secrets management**: Canvas API token stored in SSM SecureString, fetched at runtime — never in CloudFormation templates or environment variables
 
@@ -160,7 +162,7 @@ Each objective is scored on a 3-point scale: **0** (Developing), **1** (Accompli
      --profile your-profile
    ```
    
-   **Important**: This must be set BEFORE running any course reviews, or the Extraction Lambda will fail.
+   **Important**: This must be set BEFORE running any course reviews, or the Extraction Lambda will fail. A stack deployed with `STAGE` reads `/qa-bot-<stage>/canvas-api-token` instead.
 
 3. **Bootstrap CDK** (required once per AWS account/region):
    ```bash
@@ -169,47 +171,57 @@ Each objective is scored on a 3-point scale: **0** (Developing), **1** (Accompli
 
 ## Deployment
 
+The stack uploads `frontend/dist` to S3 as part of `cdk deploy`, so **the frontend must be built before the first deploy**. The frontend also needs the Cognito IDs that the first deploy creates, so a new install deploys twice: once to create the resources, and again after the frontend is rebuilt with their IDs (Step 2 below).
+
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/pitt-cic/Canvas-OLC-Insights-Public.git
+   git clone https://github.com/pitt-cic/Canvas-OLC-Insights.git
    cd Canvas-OLC-Insights
    ```
 
-2. **Deploy infrastructure:**
+2. **Build the frontend** (placeholder Cognito values are fine for this first build):
    ```bash
-   cd infra
-   npm install
+   cd frontend
+   npm ci
+   cp .env.example .env
+   npm run build
+   ```
+
+3. **Deploy the infrastructure:**
+   ```bash
+   cd ../infra
+   npm ci
    export CANVAS_BASE_URL="https://your-canvas-instance.instructure.com"
    npx cdk deploy --profile your-profile
    ```
 
-3. **Build and deploy frontend:**
-   ```bash
-   cd ../frontend
-   npm install
-   npm run build
-   aws s3 sync dist/ s3://FRONTEND_BUCKET_NAME --profile your-profile
-   ```
+### Deploy-time environment variables
 
-   The frontend bucket name and CloudFront URL are printed in CDK outputs after deploy.
+| Variable | Required | Used for |
+|:---------|:---------|:---------|
+| `CANVAS_BASE_URL` | Yes | Your Canvas instance, e.g. `https://pitt.instructure.com`. Defaults to a placeholder that will not work. |
+| `FRONTEND_URL` | No | Your CloudFront URL (from the `CloudFrontUrl` output). Added to the Cognito app client's allowed callback/logout URLs. |
+| `EVALUATION_BEDROCK_MODEL_ID` | No | Scoring model. Default `us.anthropic.claude-sonnet-4-6`. |
+| `PLAN_BEDROCK_MODEL_ID` | No | Improvement-plan model. Default `us.anthropic.claude-haiku-4-5-20251001-v1:0`. |
+| `STAGE` | No | Deploys a separate, suffixed copy, e.g. `STAGE=test` creates stack `CanvasOlcInsightsStack-test` with every resource name ending in `-test` and reads the token from `/qa-bot-test/canvas-api-token`. Use lowercase letters, digits, and hyphens. Leave unset for the default stack — changing it on an existing deployment would create new, empty resources. |
 
 ## Post-Deployment Configuration
 
-After `cdk deploy` completes, you'll see 6 outputs. Save these values - you'll need them to configure the frontend.
+After `cdk deploy` completes, it prints the stack outputs below (plus an auto-generated `ApiGatewayEndpoint…` line, the same value as `ApiUrl`). Save these values - you'll need them to configure the frontend.
 
 ### Step 1: Note CDK Outputs
 
 The deployment outputs will look like:
 ```
-✅  Canvas-OLC-Insights-Stack
+✅  CanvasOlcInsightsStack
 
 Outputs:
-Canvas-OLC-Insights-Stack.UserPoolId = us-east-1_XXXXXXXXX
-Canvas-OLC-Insights-Stack.UserPoolClientId = 26charlongstringhere
-Canvas-OLC-Insights-Stack.ApiUrl = https://xxxxx.execute-api.us-east-1.amazonaws.com/prod
-Canvas-OLC-Insights-Stack.CloudFrontUrl = https://dxxxxx.cloudfront.net
-Canvas-OLC-Insights-Stack.FrontendBucketName = canvas-olc-insights-frontend-xxxxx-us-east-1
-Canvas-OLC-Insights-Stack.CognitoHostedUiUrl = https://canvas-olc-insights-xxxxx.auth.us-east-1.amazoncognito.com
+CanvasOlcInsightsStack.UserPoolId = us-east-1_XXXXXXXXX
+CanvasOlcInsightsStack.UserPoolClientId = 26charlongstringhere
+CanvasOlcInsightsStack.ApiUrl = https://xxxxx.execute-api.us-east-1.amazonaws.com/prod/
+CanvasOlcInsightsStack.CloudFrontUrl = https://dxxxxx.cloudfront.net
+CanvasOlcInsightsStack.FrontendBucketName = canvas-olc-insights-frontend-ACCOUNT_ID-us-east-1
+CanvasOlcInsightsStack.CognitoHostedUiUrl = https://canvas-olc-insights-ACCOUNT_ID.auth.us-east-1.amazoncognito.com
 ```
 
 Copy these values for the next steps.
@@ -218,42 +230,30 @@ Copy these values for the next steps.
 
 **For Production Builds** (deployed to S3):
 
-1. Update `frontend/.env` with your deployment values:
-   ```bash
-   cd frontend
-   cp .env.example .env
-   ```
-
-2. Edit `frontend/.env`:
+1. Edit `frontend/.env` (created from `.env.example` during the first build):
    ```env
-   VITE_USER_POOL_ID=us-east-1_XXXXXXXXX         # From UserPoolId output
-   VITE_USER_POOL_CLIENT_ID=your-client-id-here  # From UserPoolClientId output
-   VITE_AWS_REGION=us-east-1                     # Your AWS region
-   VITE_API_URL=                                 # Leave empty (not used in production)
-   VITE_CLOUDFRONT_URL=                          # Leave empty (not used in production)
+   VITE_USER_POOL_ID=us-east-1_XXXXXXXXX         # From the UserPoolId output
+   VITE_USER_POOL_CLIENT_ID=your-client-id-here  # From the UserPoolClientId output
    ```
 
-   **Important**: Only `VITE_USER_POOL_ID` and `VITE_USER_POOL_CLIENT_ID` are actively used by the application for Cognito authentication.
+   These are the only `VITE_*` values the app reads (plus the optional `VITE_ENABLE_BULK_ACCEPT`, see `.env.example`). The app calls the API through CloudFront at `/api`, so no API URL is needed.
 
-3. Rebuild and redeploy frontend:
+2. Rebuild the frontend and deploy again:
    ```bash
    npm run build
    cd ../infra
-   cdk deploy --profile your-profile
+   export FRONTEND_URL="https://dxxxxx.cloudfront.net"   # your CloudFrontUrl output
+   npx cdk deploy --profile your-profile
    ```
 
-The CDK stack will automatically sync the new build to S3 and invalidate CloudFront cache.
-
-**For Local Development**:
-
-Use the same `.env` file, but Vite will proxy API requests to `localhost:8000` automatically.
+The deploy uploads the new build to S3 and invalidates the CloudFront cache.
 
 ### Step 3: Create Your First Cognito User
 
 Self-signup is disabled for security. Create users manually via AWS Console:
 
 1. Go to **AWS Console** → **Cognito** → **User Pools**
-2. Select the pool starting with `canvas-olc-insights-userpool-`
+2. Select the pool named `canvas-olc-insights-user-pool`
 3. Click **Users** → **Create user**
 4. Configure:
    - **Email address**: User's email (this is their username)
@@ -292,12 +292,12 @@ If login fails:
 
 ```bash
 cd frontend
-npm install
+npm ci
 cp .env.example .env
-# Edit .env with your Cognito User Pool ID, Client ID, API URL, and region
-# (these values come from your CDK stack outputs after deploying infra)
 npm run dev
 ```
+
+`npm run dev` serves the UI at `http://localhost:5173` for layout and styling work. In dev mode the login screen is skipped, and `/api` requests are proxied to `localhost:8000` (`frontend/vite.config.ts`) — this repository has no local API server, so API calls fail locally. Test anything that needs data against a deployed stack's CloudFront URL.
 
 ---
 
@@ -310,7 +310,7 @@ npm run dev
    - **File New Review** — Starts the automated extraction and scoring pipeline (~2-3 minutes)
    - **View Metrics** — See historical score trends for this course
 5. **Review Scores** — Once processing completes, the dashboard shows AI-proposed scores for all 50 objectives. Review each one, confirm or adjust scores, and provide human scoring for any objectives flagged for human review
-6. **Finalize** — Lock in scores, which saves the scorecard to permanent history and generates a PDF
+6. **Finalize** — Lock in scores, which saves the scorecard to permanent history and generates a PDF. Objectives the AI could not score need a written rationale first, Finalize asks for confirmation, and scores can't be changed afterwards
 7. **Generate Improvement Plan** — After finalization, trigger AI-generated recommendations for any objectives scored below Exemplary
 
 ---
@@ -319,11 +319,7 @@ npm run dev
 
 ## Per-Run Cost
 
-| Course Size | Cost/Run | Description |
-|:------------|:---------|:------------|
-| **Small** | ~$0.80 | 3-5 modules, short syllabus, few pages, ~10 assignments |
-| **Medium** | ~$1.20 | 8-12 modules, detailed syllabus, 15-30 pages, ~25 assignments |
-| **Large** | ~$1.67 | 15+ modules, long syllabus, 50+ pages, 40+ assignments, PDFs |
+A full review costs **$1.92–$8.18** with scoring on Claude Sonnet 4.6. This is the range measured across the courses in the October 2026 audit; cost grows with the amount of course content (pages, syllabus length, extracted files).
 
 ## Cost Breakdown
 
@@ -338,18 +334,29 @@ npm run dev
 
 | Courses/month | Estimated Cost |
 |:--------------|:---------------|
-| 10 | $8–$17 |
-| 50 | $40–$84 |
-| 100 | $80–$167 |
-| 500 | $400–$835 |
+| 10 | $19–$82 |
+| 50 | $96–$409 |
+| 100 | $192–$818 |
+| 500 | $960–$4,090 |
+
+These multiply the measured per-review range by the number of reviews.
 
 Infrastructure baseline (idle) is effectively $0 — all services are pay-per-request with no provisioned capacity.
 
 Cost scales primarily with content volume — longer syllabi, more pages, extracted PDFs, and detailed assignment descriptions increase token usage. All 50 objectives are scored in a single Evaluation Lambda invocation using Sonnet 4.6 with bounded concurrency (8 simultaneous Bedrock calls). Infrastructure costs are negligible.
 
-> Cost estimates based on AWS Bedrock pricing as of August 2026. Prompt caching is enabled and may reduce actual costs by 10-20%.
+> Per-review figures measured in October 2026 on AWS Bedrock pricing at that time.
 
 ---
+
+# Known Limitations
+
+These audit findings are known and intentionally deferred:
+
+- **Page links by slug**: internal-link detection matches a fixed URL pattern for Canvas page slugs; some valid page URLs may not be recognized (audit M3).
+- **Cost controls**: there is no per-review or monthly spending cap and no limit on how much course content is sent to the model (audit M4).
+- **Hardening**: the remaining hardening items from the audit (M7) are not yet done.
+- **Tests and CI**: the repository has no automated test suite or CI pipeline yet.
 
 # Troubleshooting
 

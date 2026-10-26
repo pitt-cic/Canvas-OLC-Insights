@@ -30,9 +30,11 @@ ROUTES:
     GET    /api/review/{id}/all                       — all 50 objectives: proposed scores, confirmations
     POST   /api/review/{id}/score                     — save human reviewer score (0/1/2) for one objective
            body: {"obj_id": str, "score": 0|1|2, "rationale": str}
+           rationale required when the objective has no AI score; 409 once finalized
     GET    /api/review/{id}/export                    — full JSON scorecard with section subtotals
     GET    /api/review/{id}/dashboard                 — dashboard: score grid, triage list, structural audit
     POST   /api/review/{id}/finalize                  — lock review, generate PDF, write history, trigger plan
+           400 if any objective is unscored, or has no AI score and no rationale
     GET    /api/review/{id}/pdf                       — presigned S3 URL for finalized scorecard PDF
     GET    /api/courses/{id}/history                  — past finalized reviews, newest first
     DELETE /api/courses/{id}/history/{completed_at}   — delete one history entry + its PDF
@@ -45,6 +47,9 @@ SIDE EFFECTS:
     - Starts Step Function executions (review pipeline)
     - Invokes Plan Lambda asynchronously (on finalize)
     - Canvas API calls (list accounts/courses, pagination with scope guard)
+
+ERRORS: always a JSON {"detail": str} body — 400 bad input, 404 not found,
+    409 conflict (finalized / verdict not ready), 502 Canvas failure, 500 otherwise.
 """
 
 import importlib
@@ -401,9 +406,15 @@ def _json_response(status_code: int, body):
 
 
 def _body(event) -> dict:
-    """Parse the JSON request body from an API Gateway proxy event."""
-    raw = event.get("body") or "{}"
-    return json.loads(raw)
+    """Parse the JSON request body from an API Gateway proxy event. Bad JSON is
+    the client's error, so it must come back as a 400, not an unhandled 502."""
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        body = None
+    if not isinstance(body, dict):
+        raise HttpError(400, "Request body must be a JSON object")
+    return body
 
 
 def _qs(event, key: str, default=None):
@@ -433,6 +444,8 @@ def _list_accounts(event, match):
 def _list_courses(event, match):
     """GET /api/courses — Return courses, optionally filtered by ?account_id."""
     account_id = _qs(event, "account_id")
+    if account_id and not account_id.isdigit():
+        raise HttpError(400, "account_id must be numeric")
     if account_id:
         url = f"{CANVAS_BASE_URL}/api/v1/accounts/{account_id}/courses"
     else:
@@ -456,6 +469,8 @@ def _start_review(event, match):
     course_id = body.get("course_id")
     if not course_id:
         raise HttpError(400, "course_id is required")
+    if isinstance(course_id, bool) or not str(course_id).isdigit():
+        raise HttpError(400, "course_id must be numeric")
 
     review_id = str(uuid.uuid4())[:8]
     now = datetime.now().isoformat()
@@ -581,7 +596,9 @@ def _get_all_verdicts(event, match):
 
 
 def _save_score(event, match):
-    """POST /api/review/{review_id}/score — Save a human reviewer's confirmed score (0/1/2) for one objective."""
+    """POST /api/review/{review_id}/score — Save a human reviewer's confirmed score (0/1/2) for one objective.
+    An objective with no AI score needs a rationale, since the human score is the only judgment on
+    record; was_override is only true when there was an AI score to override."""
     review_id = match.group("review_id")
     body = _body(event)
     obj_id = body.get("obj_id", "")
@@ -591,11 +608,23 @@ def _save_score(event, match):
     r = get_review(review_id)
     if not r:
         raise HttpError(404, "Review not found")
-    if score not in (0, 1, 2):
+    if r.get("status") == "finalized":
+        raise HttpError(409, "Review is finalized; scores are locked")
+    if obj_id not in OBJECTIVES:
+        raise HttpError(400, "Unknown obj_id")
+    # type() check, not `in (0, 1, 2)`: True and 1.0 compare equal to 1.
+    if type(score) is not int or score not in (0, 1, 2):
         raise HttpError(400, "Score must be 0, 1, or 2")
+    if not isinstance(rationale, str):
+        raise HttpError(400, "rationale must be a string")
 
     verdict = get_verdict(review_id, obj_id)
-    was_override = score != verdict.get("proposed_score")
+    if not verdict:
+        raise HttpError(409, "Verdict not ready yet")
+    proposed = verdict.get("proposed_score")
+    if proposed is None and not rationale.strip():
+        raise HttpError(400, "A rationale is required when there is no AI score")
+    was_override = proposed is not None and score != proposed
     save_score(review_id, obj_id, score, rationale, was_override)
     return {"ok": True, "obj_id": obj_id, "score": score}
 
@@ -1042,20 +1071,33 @@ def _record_history_and_trigger_plan(review_id: str, r: dict, totals: dict, pdf_
     )
 
 
+def _missing_rationales(scores: dict, verdicts: dict) -> list:
+    """Objectives with no AI score whose saved score has no rationale — checked again
+    at finalize because scores saved before the rule existed can lack one."""
+    return sorted(
+        obj_id for obj_id, s in scores.items()
+        if verdicts.get(obj_id, {}).get("proposed_score") is None and not str(s.get("rationale", "")).strip()
+    )
+
+
 def _finalize_review(event, match):
-    """POST /api/review/{review_id}/finalize — Lock the review: generate PDF, write history record, and trigger improvement plan generation."""
+    """POST /api/review/{review_id}/finalize — Lock the review: generate PDF, write history record, and trigger improvement plan generation.
+    Score keys that aren't real objectives (possible on rows saved before validation) are ignored."""
     review_id = match.group("review_id")
     r = get_review(review_id)
     if not r:
         raise HttpError(404, "Review not found")
     if r.get("status") == "finalized":
-        return {"ok": True, "completed_at": r.get("finalized_at", ""), "pdf_url": r.get("pdf_key", "")}
+        return {"ok": True, "completed_at": r.get("finalized_at", ""), "pdf_url": _pdf_url(r.get("pdf_key", ""))}
 
-    scores = r.get("scores", {})
-    if len(scores) < 50:
-        raise HttpError(400, f"Only {len(scores)}/50 objectives scored — finalize requires all 50")
+    scores = {k: v for k, v in r.get("scores", {}).items() if k in OBJECTIVES}
+    if len(scores) < len(OBJECTIVES):
+        raise HttpError(400, f"Only {len(scores)}/{len(OBJECTIVES)} objectives scored — finalize requires all {len(OBJECTIVES)}")
 
     verdicts = list_verdicts(review_id)
+    missing = _missing_rationales(scores, verdicts)
+    if missing:
+        raise HttpError(400, f"A rationale is required for objectives with no AI score: {', '.join(missing)}")
     now = datetime.now().isoformat()
     course_id = r.get("course_id", "")
 
@@ -1063,11 +1105,14 @@ def _finalize_review(event, match):
     pdf_data = _build_pdf_data(r, scores, verdicts, totals, review_date=now[:10])
     pdf_key = _generate_and_upload_pdf(pdf_data, course_id, review_id)
     _record_history_and_trigger_plan(review_id, r, totals, pdf_key, now)
+    return {"ok": True, "completed_at": now, "pdf_url": _pdf_url(pdf_key)}
 
-    pdf_url = _s3.generate_presigned_url(
+
+def _pdf_url(pdf_key: str) -> str:
+    """One-hour presigned download URL for a finalized scorecard PDF."""
+    return _s3.generate_presigned_url(
         "get_object", Params={"Bucket": CONTENT_BUCKET, "Key": pdf_key}, ExpiresIn=3600,
     )
-    return {"ok": True, "completed_at": now, "pdf_url": pdf_url}
 
 
 def _get_pdf(event, match):
@@ -1079,12 +1124,7 @@ def _get_pdf(event, match):
     pdf_key = r.get("pdf_key")
     if not pdf_key:
         raise HttpError(404, "No PDF available — review has not been finalized")
-    url = _s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": CONTENT_BUCKET, "Key": pdf_key},
-        ExpiresIn=3600,
-    )
-    return {"url": url}
+    return {"url": _pdf_url(pdf_key)}
 
 
 def _post_improvement_plan(event, match):
@@ -1154,15 +1194,16 @@ _ROUTES = [
     ("GET",    re.compile(r"^/api/review/(?P<review_id>[^/]+)/dashboard$"),                         _get_dashboard),
     ("POST",   re.compile(r"^/api/review/(?P<review_id>[^/]+)/finalize$"),                          _finalize_review),
     ("GET",    re.compile(r"^/api/review/(?P<review_id>[^/]+)/pdf$"),                               _get_pdf),
-    ("GET",    re.compile(r"^/api/courses/(?P<course_id>[^/]+)/history$"),                           _get_history),
-    ("DELETE", re.compile(r"^/api/courses/(?P<course_id>[^/]+)/history/(?P<completed_at>[^/]+)$"),   _delete_history_entry),
-    ("POST",   re.compile(r"^/api/courses/(?P<course_id>[^/]+)/improvement-plan$"),                  _post_improvement_plan),
-    ("GET",    re.compile(r"^/api/courses/(?P<course_id>[^/]+)/improvement-plan$"),                  _get_improvement_plan),
+    ("GET",    re.compile(r"^/api/courses/(?P<course_id>\d+)/history$"),                           _get_history),
+    ("DELETE", re.compile(r"^/api/courses/(?P<course_id>\d+)/history/(?P<completed_at>[^/]+)$"),   _delete_history_entry),
+    ("POST",   re.compile(r"^/api/courses/(?P<course_id>\d+)/improvement-plan$"),                  _post_improvement_plan),
+    ("GET",    re.compile(r"^/api/courses/(?P<course_id>\d+)/improvement-plan$"),                  _get_improvement_plan),
 ]
 
 
 def handler(event, context):
-    """Lambda entry point. Dispatches API Gateway proxy events to route handlers by matching HTTP method and path against _ROUTES."""
+    """Lambda entry point. Dispatches API Gateway proxy events to route handlers by matching HTTP method and path against _ROUTES.
+    Every failure returns JSON with CORS headers; Canvas and internal error details are logged, never returned."""
     method = event.get("httpMethod", "GET")
     path = event.get("path", "/")
 
@@ -1179,5 +1220,11 @@ def handler(event, context):
                 return _json_response(200, result)
             except HttpError as e:
                 return _json_response(e.status_code, {"detail": e.detail})
+            except CanvasIngestionError:
+                logger.exception("Canvas request failed: %s %s", method, path)
+                return _json_response(502, {"detail": "Canvas request failed"})
+            except Exception:
+                logger.exception("Unhandled error: %s %s", method, path)
+                return _json_response(500, {"detail": "Internal error"})
 
     return _json_response(404, {"detail": f"Not found: {method} {path}"})

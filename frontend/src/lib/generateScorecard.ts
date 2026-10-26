@@ -20,10 +20,6 @@ function drawHeader(doc: jsPDF, y: number): number {
   doc.setTextColor(...WHITE)
   doc.text('Course Review Scorecard', 14, 14)
 
-  doc.setFontSize(9)
-  doc.setFont('helvetica', 'normal')
-  doc.text('Online Learning Consortium', 14, 21)
-
   return y + 28
 }
 
@@ -355,5 +351,5 @@ export function generateScorecardPDF(data: ExportData): void {
     doc.text(`${i}`, 196, 290, { align: 'right' })
   }
 
-  doc.save(`OLC-Scorecard-${data.course_id}-${data.review_date}.pdf`)
+  doc.save(`Scorecard-${data.course_id}-${data.review_date}.pdf`)
 }

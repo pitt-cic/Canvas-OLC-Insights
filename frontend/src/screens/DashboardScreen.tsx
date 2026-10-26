@@ -6,9 +6,11 @@ import { api } from '../lib/api'
 import { toast } from '../store/toastStore'
 import { useFinalizeReview } from '../hooks/useFinalizeReview'
 import ProgressRing from '../components/ProgressRing'
+import ConfirmModal from '../components/ConfirmModal'
+import type { ObjectiveRow } from '../types/api'
 import { SCORE_LABELS, SCORE_COLORS, SECTIONS } from '../lib/constants'
 
-// Off unless VITE_ENABLE_BULK_ACCEPT=true at build time: bulk accept records unscored (human-judgment) items as 0.
+// Off unless VITE_ENABLE_BULK_ACCEPT=true at build time. Objectives with no AI score are never bulk-accepted.
 const BULK_ACCEPT_ENABLED = import.meta.env.VITE_ENABLE_BULK_ACCEPT === 'true'
 
 export default function DashboardScreen() {
@@ -23,6 +25,7 @@ export default function DashboardScreen() {
 
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null)
   const [showScorecard, setShowScorecard] = useState(false)
+  const [showFinalizeConfirm, setShowFinalizeConfirm] = useState(false)
   const { mutate: finalize, isPending: isFinalizing } = useFinalizeReview()
 
   const courseName = dashboardData?.course_name || 'Course'
@@ -53,6 +56,11 @@ export default function DashboardScreen() {
 
   const allConfirmed = allObjectives.length > 0 && allObjectives.every((o) => o.confirmed)
   const unconfirmed = allObjectives.filter((o) => !o.confirmed)
+  const toAccept = unconfirmed.filter((o): o is ObjectiveRow & { proposed_score: number } => o.proposed_score !== null)
+  const noAiCount = allObjectives.filter((o) => o.proposed_score === null).length
+  const changedCount = allObjectives.filter(
+    (o) => o.confirmed && o.proposed_score !== null && o.human_score !== null && o.human_score !== o.proposed_score,
+  ).length
 
   function handleChoice(mode: SortMode) {
     setSortMode(mode)
@@ -60,16 +68,16 @@ export default function DashboardScreen() {
   }
 
   const handleBulkAccept = useCallback(async () => {
-    if (!reviewId || unconfirmed.length === 0) return
-    const total = unconfirmed.length
+    if (!reviewId || toAccept.length === 0) return
+    const total = toAccept.length
     setBulkProgress({ done: 0, total })
     let failures = 0
 
-    for (let i = 0; i < unconfirmed.length; i++) {
-      const obj = unconfirmed[i]
+    for (let i = 0; i < toAccept.length; i++) {
+      const obj = toAccept[i]
       try {
-        await api.confirmScore(reviewId, obj.obj_id, obj.proposed_score ?? 0, '')
-        updateObjectiveScore(obj.obj_id, obj.proposed_score ?? 0, '')
+        await api.confirmScore(reviewId, obj.obj_id, obj.proposed_score, '')
+        updateObjectiveScore(obj.obj_id, obj.proposed_score, '')
       } catch {
         failures++
       }
@@ -82,7 +90,7 @@ export default function DashboardScreen() {
     } else {
       toast.warning(`Confirmed ${total - failures}/${total}`, `${failures} failed`)
     }
-  }, [reviewId, unconfirmed, updateObjectiveScore])
+  }, [reviewId, toAccept, updateObjectiveScore])
 
   function handleExport() {
     toggleExportPanel()
@@ -207,7 +215,7 @@ export default function DashboardScreen() {
             </div>
             <div className="flex gap-3 justify-center flex-wrap">
               <button
-                onClick={() => finalize()}
+                onClick={() => setShowFinalizeConfirm(true)}
                 disabled={isFinalizing}
                 className="px-6 py-3 rounded-xl bg-pgreen hover:bg-emerald-600 text-white font-semibold transition-all hover:shadow-lg disabled:opacity-50"
               >
@@ -230,7 +238,7 @@ export default function DashboardScreen() {
         ) : (
           <>
             {/* Bulk accept */}
-            {BULK_ACCEPT_ENABLED && unconfirmed.length > 0 && (
+            {BULK_ACCEPT_ENABLED && toAccept.length > 0 && (
               <div className="flex items-center justify-center mb-4">
                 <button
                   onClick={handleBulkAccept}
@@ -239,7 +247,7 @@ export default function DashboardScreen() {
                 >
                   {bulkProgress
                     ? `Confirming ${bulkProgress.done}/${bulkProgress.total}...`
-                    : `Accept All AI Scores (${unconfirmed.length})`
+                    : `Accept All AI Scores (${toAccept.length})`
                   }
                 </button>
               </div>
@@ -375,6 +383,16 @@ export default function DashboardScreen() {
           )}
         </div>
       </div>
+      {showFinalizeConfirm && (
+        <ConfirmModal
+          title="Finalize this review?"
+          description={`${noAiCount} objective${noAiCount === 1 ? '' : 's'} had no AI score and ${changedCount} score${changedCount === 1 ? ' was' : 's were'} changed from the AI proposal. Scores lock after finalizing.`}
+          confirmLabel="Finalize"
+          cancelLabel="Keep reviewing"
+          onConfirm={() => { setShowFinalizeConfirm(false); finalize() }}
+          onCancel={() => setShowFinalizeConfirm(false)}
+        />
+      )}
     </div>
   )
 }

@@ -36,10 +36,6 @@ export function generateImprovementPDF(plan: ImprovementPlan, courseName: string
   doc.setTextColor(...WHITE)
   doc.text('Improvement Action Plan', 14, 14)
 
-  doc.setFontSize(9)
-  doc.setFont('helvetica', 'normal')
-  doc.text('OLC Quality Scorecard', 14, 21)
-
   let y = 36
 
   // Course info

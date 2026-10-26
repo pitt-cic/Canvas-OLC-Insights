@@ -67,7 +67,7 @@ def _draw_page_footers(pdf: FPDF):
 
 
 def generate_scorecard_pdf(data: dict) -> bytes:
-    """Generate a complete OLC scorecard PDF from a data dict containing course info, objectives, scores, and section subtotals. Returns raw PDF bytes ready for S3 upload."""
+    """Generate a complete course review scorecard PDF from a data dict containing course info, objectives, scores, and section subtotals. Returns raw PDF bytes ready for S3 upload."""
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
@@ -90,7 +90,8 @@ def generate_scorecard_pdf(data: dict) -> bytes:
 
 
 def _draw_header(pdf: FPDF, data: dict):
-    """Draw the royal-blue header banner with the scorecard title and OLC branding."""
+    """Draw the royal-blue header banner with the scorecard title. The criteria are
+    based on OLC's, but the product isn't OLC-branded, so the header carries no OLC name."""
     pdf.set_fill_color(*ROYAL)
     pdf.rect(0, 0, 210, 28, "F")
 
@@ -98,10 +99,6 @@ def _draw_header(pdf: FPDF, data: dict):
     pdf.set_text_color(*WHITE)
     pdf.set_xy(14, 8)
     pdf.cell(0, 8, "Course Review Scorecard")
-
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_xy(14, 17)
-    pdf.cell(0, 5, "Online Learning Consortium")
 
 
 def _draw_watermark_banner(pdf: FPDF, y: float):

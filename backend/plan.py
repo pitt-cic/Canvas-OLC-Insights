@@ -139,9 +139,10 @@ def _put_plan(plan_key: str, body: dict):
 
 def _build_scorecard_text(objectives: dict) -> str:
     """Render the review's per-objective scores as plain text, one line per
-    objective, sorted by section letter then number (E1, E2, ..., A1, ...)."""
+    objective, sorted by section letter then number (E1, E2, ..., A1, ...).
+    Keys that aren't real objectives (old history rows) are skipped — they'd crash the sort."""
     lines = []
-    for obj_id in sorted(objectives.keys(), key=lambda x: (x[0], int(x[1:]))):
+    for obj_id in sorted((k for k in objectives if k in OBJECTIVES), key=lambda x: (x[0], int(x[1:]))):
         score = objectives[obj_id]
         obj_def = OBJECTIVES.get(obj_id, {})
         title = obj_def.get("title", obj_id)

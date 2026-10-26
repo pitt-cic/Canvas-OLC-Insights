@@ -18,6 +18,13 @@ import type {
 const BASE = ''
 
 function sanitizeError(status: number, text: string): string {
+  // The API returns {"detail": "..."}; show that message (e.g. which objectives still need a rationale).
+  try {
+    const detail = JSON.parse(text)?.detail
+    if (typeof detail === 'string' && detail) return detail
+  } catch {
+    // not JSON — fall through to the raw text
+  }
   const firstLine = text.split('\n')[0].slice(0, 120)
   return `Server error (${status}): ${firstLine}`
 }
