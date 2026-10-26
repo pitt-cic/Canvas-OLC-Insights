@@ -36,8 +36,9 @@
 ---
 
 # Demo
+https://github.com/user-attachments/assets/9010edc4-3f1e-4dff-8a1d-3a67d20b11f6
 
-[▶ Watch the demo video (MP4)](docs/media/CourseQANewDemoCompressed.mp4)
+
 
 ---
 
